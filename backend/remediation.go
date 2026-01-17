@@ -299,15 +299,16 @@ func (r *RemediationService) streamContainerLogs(ctx context.Context, containerI
 func buildAgentWrapperScript(remediationID, serviceName, repoURL, errorLog, backendURL string) string {
 	// Simple test prompt - focus only on code changes
 	prompt := fmt.Sprintf(`
-You are in a git repository. Your ONLY task is to go into the README and add a "hello world" at the very end. Thats it.
+You are in a git repository. Your ONLY task is to analyze the following error and fix the code to resolve it:
 
 Error: %s
 
 Guidelines:
-1. DO NOT commit your changes.
-2. DO NOT push your changes.
-3. DO NOT create new branches.
-Just add the hello world at the end`, strings.ReplaceAll(errorLog, "'", "'\"'\"'"))
+1. Modify the source code to fix the reported error.
+2. DO NOT commit your changes.
+3. DO NOT push your changes.
+4. DO NOT create new branches.
+Just make the necessary code edits to fix the bug.`, strings.ReplaceAll(errorLog, "'", "'\"'\"'"))
 
 	// Shell script that handles git mechanistically
 	return fmt.Sprintf(`#!/bin/sh

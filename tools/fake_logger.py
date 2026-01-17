@@ -16,8 +16,8 @@ from datetime import datetime
 
 # Configuration
 BACKEND_URL = "http://localhost:8080"
-SERVICE_NAME = "twitter-api"
-GITHUB_REPO = "https://github.com/twitter/twitter-api"
+SERVICE_NAME = "trivial-service"
+GITHUB_REPO = "https://github.com/AlexG28/trivialExample"
 
 # Fake data
 USERNAMES = [
@@ -77,25 +77,26 @@ def generate_small_file_upload():
         }
     }
 
-def generate_large_file_upload_failure():
-    """Generate a large file upload that fails"""
-    filesize = random.uniform(500, 2000)  # 500 MB to 2 GB - way too large!
-    ext = random.choice([".mp4", ".mov", ".zip", ".tar"])
-    filename = f"massive_upload_{random.randint(1000, 9999)}{ext}"
-    user = generate_username()
+def generate_type_error_failure():
+    """Generate a TypeError traceback failure"""
+    traceback = """Traceback (most recent call last):
+  File "main.py", line 9, in <module>
+    print(divide(inpt))
+          ~~~~~~^^^^^^
+  File "main.py", line 2, in divide
+    return 100 / number
+           ~~~~^~~~~~~~
+TypeError: unsupported operand type(s) for /: 'int' and 'str'"""
     
     return {
         "status": "error",
-        "error_log": f"File upload failed: {filename} ({filesize:.2f} MB) exceeds maximum allowed size (100 MB)",
+        "error_log": traceback,
         "log_data": {
-            "event_type": "file_upload_failed",
+            "event_type": "type_error",
             "details": {
-                "user": user,
-                "filename": filename,
-                "filesize_mb": round(filesize, 2),
-                "file_type": ext[1:].upper(),
-                "reason": "File size exceeds maximum allowed (100 MB)",
-                "max_allowed_mb": 100
+                "user": generate_username(),
+                "reason": "TypeError in main.py",
+                "traceback": traceback
             }
         }
     }
@@ -120,11 +121,11 @@ def send_heartbeat(data):
         return False
 
 def generate_event():
-    """Generate a random event with ~10% chance of large file failure"""
+    """Generate a random event with ~1% chance of TypeError failure"""
     roll = random.random()
     
-    if roll < 0.01:  # 1% chance of large file failure
-        return generate_large_file_upload_failure(), "FAILURE"
+    if roll < 0.01:  # 1% chance of TypeError failure
+        return generate_type_error_failure(), "FAILURE"
     elif roll < 0.10:  # 9% chance of small file upload
         return generate_small_file_upload(), "FILE"
     else:  # 90% chance of text message
@@ -142,7 +143,7 @@ def main():
     
     print(f"""
 ╔══════════════════════════════════════════════════════════╗
-║       🐦 Highline Fake Log Generator - Twitter API       ║
+║      🐦 Highline Fake Log Generator - Trivial API        ║
 ╠══════════════════════════════════════════════════════════╣
 ║  Backend URL: {args.url:<42}                             ║
 ║  Interval: {args.interval}s                              ║
@@ -162,7 +163,7 @@ def main():
             if event_type == "FAILURE":
                 icon = "🔴"
                 details = event_data["log_data"]["details"]
-                desc = f"FAILED: {details['filename']} ({details['filesize_mb']:.1f} MB)"
+                desc = f"CRASH: {details['reason']}"
             elif event_type == "FILE":
                 icon = "📁"
                 details = event_data["log_data"]["details"]
