@@ -127,9 +127,9 @@ func main() {
 	slog.Info("Server stopped")
 }
 
-// runTimeoutChecker periodically checks for timed out services
+// runTimeoutChecker periodically checks for timed out services and updates uptime
 func (app *App) runTimeoutChecker(ctx context.Context) {
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -137,16 +137,22 @@ func (app *App) runTimeoutChecker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			downServices := app.store.CheckTimeouts()
+			// Check for newly timed out services
+			downServices, updatedServices := app.store.CheckTimeoutsAndUpdateUptime()
+			
+			// Handle newly down services
 			for _, service := range downServices {
 				slog.Warn("Service timed out",
 					"service", service.Name,
 					"last_heartbeat", service.LastHeartbeat,
 				)
-				// Broadcast the update to all WebSocket clients
-				app.BroadcastServiceUpdate(service)
 				// Trigger remediation for timed out services
 				go app.TriggerRemediation(service, "Service heartbeat timeout - no response received")
+			}
+			
+			// Broadcast all updated services to WebSocket clients
+			for _, service := range updatedServices {
+				app.BroadcastServiceUpdate(service)
 			}
 		}
 	}

@@ -232,31 +232,53 @@ func (s *ServiceStore) GetAllServices() []Service {
 // CheckTimeouts checks for services that haven't sent heartbeats within the timeout
 // Returns services that just went down (for remediation)
 func (s *ServiceStore) CheckTimeouts() []*Service {
+	downServices, _ := s.CheckTimeoutsAndUpdateUptime()
+	return downServices
+}
+
+// CheckTimeoutsAndUpdateUptime checks for timed out services AND updates uptime for all unhealthy services
+// Returns: (newly down services, all services that were updated)
+func (s *ServiceStore) CheckTimeoutsAndUpdateUptime() ([]*Service, []*Service) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var downServices []*Service
+	var newlyDownServices []*Service
+	var updatedServices []*Service
 	now := time.Now()
 
 	for _, service := range s.services {
+		wasUpdated := false
+		
+		// Check if service just timed out
 		if service.Status != StatusDown && now.Sub(service.LastHeartbeat) > s.timeout {
 			service.Status = StatusDown
 			service.TotalChecks++
-			// Recalculate uptime
-			if service.TotalChecks > 0 {
-				service.UptimePercent = float64(service.SuccessChecks) / float64(service.TotalChecks) * 100
-			}
 			// Add status change log
 			service.addLog(LogEntry{
 				Timestamp: now,
 				Type:      "status",
 				Message:   "Service marked as DOWN - heartbeat timeout",
 			})
-			downServices = append(downServices, service)
+			newlyDownServices = append(newlyDownServices, service)
+			wasUpdated = true
+		} else if service.Status == StatusDown || service.Status == StatusError {
+			// For services that are down or in error state, continue incrementing checks
+			// This makes uptime percentage continuously decrease while service is unhealthy
+			service.TotalChecks++
+			wasUpdated = true
+		}
+		
+		// Recalculate uptime percentage
+		if wasUpdated && service.TotalChecks > 0 {
+			service.UptimePercent = float64(service.SuccessChecks) / float64(service.TotalChecks) * 100
+			
+			// Make a copy for the updated list
+			serviceCopy := *service
+			updatedServices = append(updatedServices, &serviceCopy)
 		}
 	}
 
-	return downServices
+	return newlyDownServices, updatedServices
 }
 
 // AddRemediationLog adds a remediation log entry to a service
