@@ -28,20 +28,11 @@ type RemediationService struct {
 
 // NewRemediationService creates a new remediation service
 func NewRemediationService(store *RemediationStore) *RemediationService {
-	// #region agent log
-	debugLog("backend/remediation.go:31", "Attempting Docker client creation", "H2", nil)
-	// #endregion
 	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		// #region agent log
-		debugLog("backend/remediation.go:35", "Docker client creation failed", "H2", map[string]interface{}{"error": err.Error()})
-		// #endregion
 		slog.Warn("Failed to create Docker client - remediation disabled", "error", err)
 		return &RemediationService{store: store}
 	}
-	// #region agent log
-	debugLog("backend/remediation.go:40", "Docker client created successfully", "H2", nil)
-	// #endregion
 
 	openCodeImage := os.Getenv("OPENCODE_IMAGE")
 	if openCodeImage == "" {
@@ -63,25 +54,6 @@ func NewRemediationService(store *RemediationStore) *RemediationService {
 
 	githubPat := os.Getenv("GITHUB_PAT")
 	key := os.Getenv("CEREBRAS_API_KEY")
-
-	// #region agent log
-	debugLog("backend/remediation.go:67", "Environment variables check", "H3", map[string]interface{}{
-		"GITHUB_PAT_LEN":   len(githubPat),
-		"CEREBRAS_KEY_LEN": len(key),
-		"GITHUB_PAT_START": func() string {
-			if len(githubPat) > 4 {
-				return githubPat[:4]
-			}
-			return ""
-		}(),
-		"CEREBRAS_KEY_START": func() string {
-			if len(key) > 4 {
-				return key[:4]
-			}
-			return ""
-		}(),
-	})
-	// #endregion
 
 	return &RemediationService{
 		dockerClient:  dockerClient,
@@ -189,24 +161,11 @@ func (r *RemediationService) RunOpenCode(repoURL, errorLog, serviceName string) 
 		"container_name", containerName,
 	)
 
-	// #region agent log
-	debugLog("backend/remediation.go:193", "Calling ContainerCreate", "H6,H7", map[string]interface{}{
-		"image":     containerConfig.Image,
-		"env_count": len(containerConfig.Env),
-	})
-	// #endregion
-
 	resp, err := r.dockerClient.ContainerCreate(ctx, containerConfig, hostConfig, nil, nil, containerName)
 	if err != nil {
-		// #region agent log
-		debugLog("backend/remediation.go:202", "ContainerCreate failed", "H6,H7", map[string]interface{}{"error": err.Error()})
-		// #endregion
 		r.store.Complete(remediationID, false, -1, fmt.Sprintf("Failed to create container: %v", err))
 		return fmt.Errorf("failed to create container: %w", err)
 	}
-	// #region agent log
-	debugLog("backend/remediation.go:207", "ContainerCreate successful", "H6,H7", map[string]interface{}{"container_id": resp.ID})
-	// #endregion
 
 	r.store.UpdateStatus(remediationID, RemediationRunning, resp.ID, containerName)
 	record.ContainerID = resp.ID
@@ -217,7 +176,7 @@ func (r *RemediationService) RunOpenCode(repoURL, errorLog, serviceName string) 
 	)
 
 	// Ensure cleanup
-	defer r.cleanupContainer(context.Background(), resp.ID, containerName, remediationID)
+	// defer r.cleanupContainer(context.Background(), resp.ID, containerName, remediationID)
 
 	// Start the container
 	if err := r.dockerClient.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
@@ -352,6 +311,27 @@ echo "Remediation ID: %s"
 echo "Service: %s"
 echo "Repository: %s"
 echo ""
+
+# Configure OpenCode
+mkdir -p ~/.config/opencode
+cat <<EOF > ~/.config/opencode/opencode.json
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "model": "cerebras/llama-3.3-70b",
+  "provider": {
+    "cerebras": {
+      "models": {
+        "llama-3.3-70b": {
+          "id": "llama-3.3-70b"
+        }
+      },
+      "options": {
+        "apiKey": "{env:CEREBRAS_API_KEY}"
+      }
+    }
+  }
+}
+EOF
 
 # Create workspace
 mkdir -p /workspace

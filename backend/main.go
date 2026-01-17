@@ -1,9 +1,7 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"os"
@@ -13,26 +11,6 @@ import (
 
 	"github.com/joho/godotenv"
 )
-
-// #region agent log
-func debugLog(location, message, hypothesisId string, data map[string]interface{}) {
-	payload := map[string]interface{}{
-		"sessionId":    "debug-session",
-		"runId":        "initial-debug",
-		"hypothesisId": hypothesisId,
-		"location":     location,
-		"message":      message,
-		"data":         data,
-		"timestamp":    time.Now().UnixMilli(),
-	}
-	body, _ := json.Marshal(payload)
-	resp, err := http.Post("http://host.docker.internal:7242/ingest/818bdc5c-c7d4-4800-bfc7-d2b244b48aae", "application/json", bytes.NewBuffer(body))
-	if err == nil {
-		resp.Body.Close()
-	}
-}
-
-// #endregion
 
 // App holds the application dependencies
 type App struct {
@@ -49,18 +27,6 @@ func main() {
 			slog.Info("No .env file found or error loading it, using system environment variables")
 		}
 	}
-
-	// #region agent log
-	cwd, _ := os.Getwd()
-	debugLog("backend/main.go:22", "Main function entry", "H1,H3,H4", map[string]interface{}{
-		"PORT":             os.Getenv("PORT"),
-		"GITHUB_PAT_SET":   os.Getenv("GITHUB_PAT") != "",
-		"CEREBRAS_KEY_SET": os.Getenv("CEREBRAS_API_KEY") != "",
-		"STATIC_DIR":       os.Getenv("STATIC_DIR"),
-		"CWD":              cwd,
-		"ENV_COUNT":        len(os.Environ()),
-	})
-	// #endregion
 
 	// Configure structured JSON logging
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
@@ -151,11 +117,7 @@ func main() {
 	// Start server in goroutine
 	go func() {
 		slog.Info("Server starting", "port", port, "heartbeat_timeout", timeout.String())
-		err := server.ListenAndServe()
-		// #region agent log
-		debugLog("backend/main.go:113", "ListenAndServe returned", "H1", map[string]interface{}{"error": err.Error()})
-		// #endregion
-		if err != http.ErrServerClosed {
+		if err := server.ListenAndServe(); err != http.ErrServerClosed {
 			slog.Error("Server error", "error", err)
 			os.Exit(1)
 		}
