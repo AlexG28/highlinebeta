@@ -120,13 +120,13 @@ def send_heartbeat(data):
         print(f"  ❌ Failed to send: {e}")
         return False
 
-def generate_event():
-    """Generate a random event with ~1% chance of TypeError failure"""
-    roll = random.random()
-    
-    if roll < 0.01:  # 1% chance of TypeError failure
+def generate_event(count):
+    """Generate a random event, but force failure on the 11th message (after 10 successes)"""
+    if count == 11:
         return generate_type_error_failure(), "FAILURE"
-    elif roll < 0.10:  # 9% chance of small file upload
+    
+    roll = random.random()
+    if roll < 0.10:  # 10% chance of small file upload
         return generate_small_file_upload(), "FILE"
     else:  # 90% chance of text message
         return generate_text_message(), "TEXT"
@@ -155,7 +155,7 @@ def main():
     try:
         while args.count == 0 or count < args.count:
             count += 1
-            event_data, event_type = generate_event()
+            event_data, event_type = generate_event(count)
             
             timestamp = datetime.now().strftime("%H:%M:%S")
             
