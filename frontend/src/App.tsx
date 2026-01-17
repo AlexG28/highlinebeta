@@ -4,11 +4,15 @@ import ServiceCard from './components/ServiceCard';
 import ServiceLogs from './components/ServiceLogs';
 import Header from './components/Header';
 import StatsBar from './components/StatsBar';
+import Remediations from './components/Remediations';
+
+type View = 'services' | 'remediations';
 
 function App() {
   const { services, connected, error, reconnect } = useWebSocket();
   const [currentTime, setCurrentTime] = useState<Date>(new Date());
   const [selectedService, setSelectedService] = useState<string | null>(null);
+  const [view, setView] = useState<View>('services');
 
   // Tick clock every second for consistent time display
   useEffect(() => {
@@ -33,18 +37,41 @@ function App() {
     setSelectedService(prev => prev === serviceName ? null : serviceName);
   };
 
+  if (view === 'remediations') {
+    return (
+      <div className="min-h-screen grid-pattern">
+        <div className="max-w-7xl mx-auto px-4 py-8">
+          <Remediations onBack={() => setView('services')} />
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen grid-pattern">
       <div className="max-w-7xl mx-auto px-4 py-8">
         <Header currentTime={currentTime} connected={connected} />
         
-        <StatsBar 
-          total={services.length}
-          healthy={healthyCount}
-          errors={errorCount}
-          down={downCount}
-          avgUptime={avgUptime}
-        />
+        {/* Navigation */}
+        <div className="flex items-center justify-between mb-6">
+          <StatsBar 
+            total={services.length}
+            healthy={healthyCount}
+            errors={errorCount}
+            down={downCount}
+            avgUptime={avgUptime}
+          />
+          
+          <button
+            onClick={() => setView('remediations')}
+            className="flex items-center gap-2 px-4 py-2 bg-highline-card border border-highline-border rounded-lg hover:border-highline-accent/50 transition-colors"
+          >
+            <svg className="w-4 h-4 text-highline-accent" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z" />
+            </svg>
+            <span className="text-sm">Remediations</span>
+          </button>
+        </div>
 
         {!connected && error ? (
           <div className="bg-highline-card border border-highline-error/30 rounded-xl p-6 text-center">

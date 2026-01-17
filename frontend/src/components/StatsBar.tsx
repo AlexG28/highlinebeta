@@ -10,7 +10,7 @@ export default function StatsBar({ total, healthy, errors, down, avgUptime }: St
   if (total === 0) return null;
   
   return (
-    <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-8">
+    <div className="grid grid-cols-2 md:grid-cols-5 gap-4 flex-1">
       <StatCard 
         label="Total Services" 
         value={total.toString()} 

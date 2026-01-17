@@ -1,32 +1,37 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
+	"github.com/google/uuid"
 )
 
 // RemediationService handles spawning OpenCode containers for auto-fix
 type RemediationService struct {
-	dockerClient *client.Client
-	githubPAT    string
+	dockerClient  *client.Client
+	store         *RemediationStore
+	githubPAT     string
 	openCodeImage string
 	anthropicKey  string
+	backendURL    string
 }
 
 // NewRemediationService creates a new remediation service
-func NewRemediationService() *RemediationService {
+func NewRemediationService(store *RemediationStore) *RemediationService {
 	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		slog.Warn("Failed to create Docker client - remediation disabled", "error", err)
-		return &RemediationService{}
+		return &RemediationService{store: store}
 	}
 
 	openCodeImage := os.Getenv("OPENCODE_IMAGE")
@@ -34,60 +39,88 @@ func NewRemediationService() *RemediationService {
 		openCodeImage = "ghcr.io/anomalyco/opencode:latest"
 	}
 
+	backendURL := os.Getenv("BACKEND_URL")
+	if backendURL == "" {
+		backendURL = "http://host.docker.internal:8080"
+	}
+
+	slog.Info("Remediation service initialized",
+		"docker_client", "connected",
+		"opencode_image", openCodeImage,
+		"backend_url", backendURL,
+		"github_pat_set", os.Getenv("GITHUB_PAT") != "",
+		"anthropic_key_set", os.Getenv("ANTHROPIC_API_KEY") != "",
+	)
+
 	return &RemediationService{
 		dockerClient:  dockerClient,
+		store:         store,
 		githubPAT:     os.Getenv("GITHUB_PAT"),
 		openCodeImage: openCodeImage,
 		anthropicKey:  os.Getenv("ANTHROPIC_API_KEY"),
+		backendURL:    backendURL,
 	}
 }
 
 // RunOpenCode spawns an OpenCode container to analyze and fix issues
 func (r *RemediationService) RunOpenCode(repoURL, errorLog, serviceName string) error {
+	// Generate unique ID for this remediation
+	remediationID := uuid.New().String()[:8]
+
+	// Create record in store
+	record := r.store.Create(remediationID, serviceName, repoURL, errorLog)
+	
+	slog.Info("[REMEDIATION] Starting remediation",
+		"id", remediationID,
+		"service", serviceName,
+		"repo", repoURL,
+	)
+
+	// Validate prerequisites
 	if r.dockerClient == nil {
+		r.store.Complete(remediationID, false, -1, "Docker client not available")
 		return fmt.Errorf("docker client not available")
 	}
 
 	if r.githubPAT == "" {
+		r.store.Complete(remediationID, false, -1, "GITHUB_PAT not set")
 		return fmt.Errorf("GITHUB_PAT environment variable not set")
 	}
 
 	if r.anthropicKey == "" {
+		r.store.Complete(remediationID, false, -1, "ANTHROPIC_API_KEY not set")
 		return fmt.Errorf("ANTHROPIC_API_KEY environment variable not set")
 	}
 
+	// Create context with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	slog.Info("Pulling OpenCode image", "image", r.openCodeImage)
+	// Pull the OpenCode image
+	slog.Info("[REMEDIATION] Pulling OpenCode image",
+		"id", remediationID,
+		"image", r.openCodeImage,
+	)
 
-	// Pull the image
 	reader, err := r.dockerClient.ImagePull(ctx, r.openCodeImage, image.PullOptions{})
 	if err != nil {
-		slog.Warn("Failed to pull image, attempting to use local", "error", err)
+		slog.Warn("[REMEDIATION] Failed to pull image, using local",
+			"id", remediationID,
+			"error", err,
+		)
 	} else {
-		defer reader.Close()
 		io.Copy(io.Discard, reader)
+		reader.Close()
 	}
 
-	// Create the prompt for OpenCode
-	prompt := fmt.Sprintf(`You are fixing an issue in a microservice. 
-
-Service: %s
-Repository: %s
-
-The service has reported the following error:
-%s
-
-Please:
-1. Clone the repository
-2. Analyze the error and find the root cause
-3. Fix the issue
-4. Commit and push the fix
-
-Use git commands to clone, commit, and push. The GITHUB_TOKEN environment variable is available for authentication.`, serviceName, repoURL, errorLog)
+	// Build the wrapper script that runs OpenCode and reports back
+	wrapperScript := buildAgentWrapperScript(remediationID, serviceName, repoURL, errorLog, r.backendURL)
 
 	// Container configuration
+	containerName := fmt.Sprintf("highline-fix-%s", remediationID)
+	
+	r.store.UpdateStatus(remediationID, RemediationRunning, "", containerName)
+
 	containerConfig := &container.Config{
 		Image: r.openCodeImage,
 		Env: []string{
@@ -97,75 +130,268 @@ Use git commands to clone, commit, and push. The GITHUB_TOKEN environment variab
 			"GIT_AUTHOR_EMAIL=autofix@highline.local",
 			"GIT_COMMITTER_NAME=Highline AutoFix",
 			"GIT_COMMITTER_EMAIL=autofix@highline.local",
+			"REMEDIATION_ID=" + remediationID,
+			"SERVICE_NAME=" + serviceName,
+			"REPO_URL=" + repoURL,
+			"BACKEND_URL=" + r.backendURL,
 		},
 		Cmd: []string{
-			"opencode",
-			"--print",
-			"--dangerously-skip-permissions",
-			prompt,
+			"/bin/sh", "-c", wrapperScript,
 		},
 		WorkingDir: "/workspace",
+		Tty:        false,
 	}
 
 	hostConfig := &container.HostConfig{
-		AutoRemove: true,
+		AutoRemove: false,
 		Resources: container.Resources{
-			Memory: 2 * 1024 * 1024 * 1024, // 2GB
+			Memory:   2 * 1024 * 1024 * 1024,
+			NanoCPUs: 2 * 1e9,
 		},
+		// Allow container to reach host network for callback
+		ExtraHosts: []string{"host.docker.internal:host-gateway"},
 	}
 
-	containerName := fmt.Sprintf("highline-remediation-%s-%d", serviceName, time.Now().Unix())
-
-	slog.Info("Creating remediation container",
-		"container", containerName,
-		"service", serviceName,
+	// Create the container
+	slog.Info("[REMEDIATION] Creating container",
+		"id", remediationID,
+		"container_name", containerName,
 	)
 
-	// Create container
 	resp, err := r.dockerClient.ContainerCreate(ctx, containerConfig, hostConfig, nil, nil, containerName)
 	if err != nil {
+		r.store.Complete(remediationID, false, -1, fmt.Sprintf("Failed to create container: %v", err))
 		return fmt.Errorf("failed to create container: %w", err)
 	}
 
-	// Start container
+	r.store.UpdateStatus(remediationID, RemediationRunning, resp.ID, containerName)
+	record.ContainerID = resp.ID
+
+	slog.Info("[REMEDIATION] Container created",
+		"id", remediationID,
+		"container_id", resp.ID[:12],
+	)
+
+	// Ensure cleanup
+	defer r.cleanupContainer(context.Background(), resp.ID, containerName, remediationID)
+
+	// Start the container
 	if err := r.dockerClient.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		r.store.Complete(remediationID, false, -1, fmt.Sprintf("Failed to start container: %v", err))
 		return fmt.Errorf("failed to start container: %w", err)
 	}
 
-	slog.Info("Remediation container started",
-		"container_id", resp.ID,
-		"service", serviceName,
+	slog.Info("[REMEDIATION] Container started - OpenCode agent is working",
+		"id", remediationID,
+		"container_id", resp.ID[:12],
 	)
 
-	// Wait for container to finish
+	// Stream logs in background
+	go r.streamContainerLogs(ctx, resp.ID, remediationID)
+
+	// Wait for completion
 	statusCh, errCh := r.dockerClient.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
+
 	select {
 	case err := <-errCh:
 		if err != nil {
+			r.store.Complete(remediationID, false, -1, fmt.Sprintf("Error waiting: %v", err))
 			return fmt.Errorf("error waiting for container: %w", err)
 		}
+
 	case status := <-statusCh:
-		if status.StatusCode != 0 {
-			// Get container logs for debugging
-			logs, _ := r.dockerClient.ContainerLogs(ctx, resp.ID, container.LogsOptions{
-				ShowStdout: true,
-				ShowStderr: true,
-				Tail:       "50",
-			})
-			if logs != nil {
-				logBytes, _ := io.ReadAll(logs)
-				slog.Error("Container failed", "logs", string(logBytes))
-				logs.Close()
-			}
-			return fmt.Errorf("container exited with status %d", status.StatusCode)
+		success := status.StatusCode == 0
+		r.store.Complete(remediationID, success, status.StatusCode, "")
+
+		if success {
+			slog.Info("[REMEDIATION] Container completed successfully",
+				"id", remediationID,
+				"exit_code", 0,
+			)
+		} else {
+			slog.Error("[REMEDIATION] Container failed",
+				"id", remediationID,
+				"exit_code", status.StatusCode,
+			)
+			return fmt.Errorf("container exited with code %d", status.StatusCode)
 		}
+
 	case <-ctx.Done():
+		r.store.SetTimedOut(remediationID)
+		slog.Error("[REMEDIATION] Timeout - stopping container",
+			"id", remediationID,
+		)
+		stopTimeout := 10
+		r.dockerClient.ContainerStop(context.Background(), resp.ID, container.StopOptions{Timeout: &stopTimeout})
 		return fmt.Errorf("remediation timed out")
 	}
 
-	slog.Info("Remediation completed successfully",
-		"service", serviceName,
+	return nil
+}
+
+// cleanupContainer removes the container
+func (r *RemediationService) cleanupContainer(ctx context.Context, containerID, containerName, remediationID string) {
+	slog.Info("[REMEDIATION] Cleaning up container",
+		"id", remediationID,
+		"container_id", containerID[:12],
 	)
 
-	return nil
+	err := r.dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{
+		Force:         true,
+		RemoveVolumes: true,
+	})
+
+	if err != nil {
+		slog.Warn("[REMEDIATION] Failed to remove container",
+			"id", remediationID,
+			"error", err,
+		)
+	} else {
+		slog.Info("[REMEDIATION] Container removed",
+			"id", remediationID,
+		)
+	}
+}
+
+// streamContainerLogs streams container logs
+func (r *RemediationService) streamContainerLogs(ctx context.Context, containerID, remediationID string) {
+	reader, err := r.dockerClient.ContainerLogs(ctx, containerID, container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Follow:     true,
+		Timestamps: true,
+	})
+	if err != nil {
+		return
+	}
+	defer reader.Close()
+
+	scanner := bufio.NewScanner(reader)
+	lineCount := 0
+	for scanner.Scan() {
+		line := scanner.Text()
+		if len(line) > 8 {
+			cleanLine := line[8:]
+			if strings.TrimSpace(cleanLine) != "" {
+				lineCount++
+				if lineCount <= 5 || lineCount%20 == 0 || 
+				   strings.Contains(strings.ToLower(cleanLine), "error") || 
+				   strings.Contains(strings.ToLower(cleanLine), "success") ||
+				   strings.Contains(strings.ToLower(cleanLine), "commit") ||
+				   strings.Contains(strings.ToLower(cleanLine), "push") {
+					slog.Debug("[REMEDIATION][LOG]",
+						"id", remediationID,
+						"line", lineCount,
+						"content", truncateString(cleanLine, 150),
+					)
+				}
+			}
+		}
+	}
+}
+
+// buildAgentWrapperScript creates a shell script that runs OpenCode and reports back
+func buildAgentWrapperScript(remediationID, serviceName, repoURL, errorLog, backendURL string) string {
+	// Escape special characters in error log for shell
+	escapedError := strings.ReplaceAll(errorLog, "'", "'\"'\"'")
+	escapedError = strings.ReplaceAll(escapedError, "\n", " ")
+	if len(escapedError) > 500 {
+		escapedError = escapedError[:500]
+	}
+
+	prompt := fmt.Sprintf(`You are an automated bug-fixing agent. Fix the error in service "%s".
+
+Repository: %s
+
+Error:
+%s
+
+Steps:
+1. Clone: git clone %s /workspace/repo
+2. cd /workspace/repo
+3. Analyze and fix the error
+4. Commit: git commit -am "fix: description"
+5. Push: git push
+
+GITHUB_TOKEN is set for auth. Keep fix minimal.`, serviceName, repoURL, escapedError, repoURL)
+
+	// Shell script that:
+	// 1. Runs OpenCode with the prompt
+	// 2. Captures the result
+	// 3. Sends a report back to the backend
+	return fmt.Sprintf(`#!/bin/sh
+set -e
+
+echo "=== HIGHLINE AGENT STARTED ==="
+echo "Remediation ID: %s"
+echo "Service: %s"
+echo "Repository: %s"
+echo ""
+
+# Create workspace
+mkdir -p /workspace
+cd /workspace
+
+# Run OpenCode
+echo "=== RUNNING OPENCODE ==="
+OPENCODE_OUTPUT=$(opencode --print --dangerously-skip-permissions '%s' 2>&1) || OPENCODE_EXIT=$?
+OPENCODE_EXIT=${OPENCODE_EXIT:-0}
+
+echo ""
+echo "=== OPENCODE FINISHED (exit: $OPENCODE_EXIT) ==="
+
+# Check if repo was cloned and has commits
+COMMIT_HASH=""
+FILES_CHANGED=""
+PUSHED="false"
+
+if [ -d "/workspace/repo/.git" ]; then
+    cd /workspace/repo
+    COMMIT_HASH=$(git rev-parse HEAD 2>/dev/null || echo "")
+    FILES_CHANGED=$(git diff --name-only HEAD~1 2>/dev/null | tr '\n' ',' || echo "")
+    
+    # Check if we pushed
+    if git log --oneline -1 2>/dev/null | grep -q "fix:"; then
+        PUSHED="true"
+    fi
+fi
+
+# Determine success
+if [ "$OPENCODE_EXIT" -eq 0 ] && [ -n "$COMMIT_HASH" ]; then
+    SUCCESS="true"
+    SUMMARY="Successfully analyzed and attempted fix"
+else
+    SUCCESS="false"
+    SUMMARY="Failed to complete fix"
+fi
+
+echo ""
+echo "=== SENDING REPORT TO BACKEND ==="
+
+# Send report back to backend
+curl -X POST "%s/api/remediation/report" \
+    -H "Content-Type: application/json" \
+    -d '{
+        "remediation_id": "%s",
+        "success": '$SUCCESS',
+        "summary": "'"$SUMMARY"'",
+        "commit_hash": "'"$COMMIT_HASH"'",
+        "pushed": '$PUSHED',
+        "files_changed": ["'"$FILES_CHANGED"'"],
+        "logs": "OpenCode exit code: '"$OPENCODE_EXIT"'"
+    }' 2>/dev/null || echo "Failed to send report"
+
+echo ""
+echo "=== AGENT COMPLETE ==="
+
+exit $OPENCODE_EXIT
+`, remediationID, serviceName, repoURL, strings.ReplaceAll(prompt, "'", "'\"'\"'"), backendURL, remediationID)
+}
+
+// truncateString truncates a string to maxLen
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
 }

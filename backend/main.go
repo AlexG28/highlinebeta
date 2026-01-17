@@ -12,9 +12,10 @@ import (
 
 // App holds the application dependencies
 type App struct {
-	store       *ServiceStore
-	remediation *RemediationService
-	wsHub       *WSHub
+	store            *ServiceStore
+	remediation      *RemediationService
+	remediationStore *RemediationStore
+	wsHub            *WSHub
 }
 
 func main() {
@@ -41,13 +42,15 @@ func main() {
 
 	// Initialize services
 	store := NewServiceStore(timeout)
-	remediation := NewRemediationService()
+	remediationStore := NewRemediationStore()
+	remediation := NewRemediationService(remediationStore)
 	wsHub := NewWSHub()
 
 	app := &App{
-		store:       store,
-		remediation: remediation,
-		wsHub:       wsHub,
+		store:            store,
+		remediation:      remediation,
+		remediationStore: remediationStore,
+		wsHub:            wsHub,
 	}
 
 	// Setup routes
@@ -58,6 +61,9 @@ func main() {
 	mux.HandleFunc("/api/services", app.ServicesHandler)
 	mux.HandleFunc("/api/services/", app.ServiceHandler)
 	mux.HandleFunc("/api/health", app.HealthHandler)
+	mux.HandleFunc("/api/remediations", app.RemediationsHandler)
+	mux.HandleFunc("/api/remediations/", app.RemediationDetailHandler)
+	mux.HandleFunc("/api/remediation/report", app.RemediationReportHandler)
 	
 	// Legacy endpoints (for backwards compatibility)
 	mux.HandleFunc("/heartbeat", app.HeartbeatHandler)
