@@ -304,9 +304,14 @@ Repository: %s
 Your task is simple:
 1. Clone the repo: git clone %s /workspace/repo
 2. cd /workspace/repo
-3. Add "hello world" to the very end of README.md
-4. Commit: git commit -am "test: added hello world"
-5. Push: git push
+3. create a new branch with an appropriate name (such as adding-hello-world)
+4. Add "hello world" to the very end of README.md
+5. Commit: git commit -am "test: added hello world"
+6. Push: git push
+
+If you encounter an issue with any step here, work around it. If a directory already exists, ok fine, make another one. 
+It doesn't have to be that specific or precise. Just roughly, clone the repo, add a hello world in the end, and push it in a new branch. 
+All you gotta do. The above steps are purely for guidance. 
 
 GITHUB_TOKEN is set for authentication. That's it - just add hello world to the README and push.`, repoURL, repoURL)
 
@@ -331,6 +336,14 @@ echo "CEREBRAS_API_KEY length: ${#CEREBRAS_API_KEY}"
 echo "GITHUB_TOKEN set: $([ -n "$GITHUB_TOKEN" ] && echo 'YES' || echo 'NO')"
 echo ""
 
+# Pre-install essential dev tools
+echo "=== INSTALLING DEV TOOLS ==="
+if command -v apk >/dev/null; then
+    apk add --no-cache git 
+elif command -v apt-get >/dev/null; then
+    apt-get update && apt-get install -y git
+fi
+
 # Configure OpenCode for Cerebras
 echo "=== CONFIGURING OPENCODE ==="
 mkdir -p $HOME/.config/opencode
@@ -340,12 +353,12 @@ echo "Config dir: $HOME/.config/opencode"
 	cat > $HOME/.config/opencode/opencode.json << 'CONFIGEOF'
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "cerebras/llama-3.3-70b",
+  "model": "gpt-oss-120b",
   "provider": {
     "cerebras": {
       "models": {
-        "llama-3.3-70b": {
-          "id": "llama-3.3-70b"
+        "gpt-oss-120b": {
+          "id": "gpt-oss-120b"
         }
       },
       "options": {

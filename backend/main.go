@@ -191,6 +191,17 @@ func spaHandler(fs http.Handler, staticDir string) http.Handler {
 
 // TriggerRemediation triggers the OpenCode remediation for a failed service
 func (app *App) TriggerRemediation(service *Service, errorLog string) {
+	// Check if a remediation is already in progress for this service
+	existingRemediations := app.remediationStore.GetByService(service.Name)
+	for _, r := range existingRemediations {
+		if r.Status == RemediationRunning || r.Status == RemediationPending {
+			slog.Info("Remediation already in progress for service, skipping duplicate trigger",
+				"service", service.Name,
+				"status", r.Status)
+			return
+		}
+	}
+
 	if service.GitHubRepo == "" {
 		slog.Warn("Cannot remediate service without GitHub repo", "service", service.Name)
 		return
