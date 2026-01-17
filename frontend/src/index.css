@@ -35,23 +35,97 @@ body {
   background-clip: text;
 }
 
-/* Grid pattern background */
+/* Enhanced grid pattern background */
 .grid-pattern {
-  background-image: 
-    linear-gradient(rgba(30, 30, 46, 0.5) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(30, 30, 46, 0.5) 1px, transparent 1px);
+  background-image:
+    linear-gradient(rgba(30, 30, 46, 0.3) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(30, 30, 46, 0.3) 1px, transparent 1px);
   background-size: 40px 40px;
+  position: relative;
 }
 
-/* Glow effects */
+.grid-pattern::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: radial-gradient(circle at 20% 50%, rgba(0, 255, 136, 0.05) 0%, transparent 50%),
+              radial-gradient(circle at 80% 20%, rgba(0, 204, 255, 0.05) 0%, transparent 50%),
+              radial-gradient(circle at 40% 80%, rgba(255, 170, 0, 0.03) 0%, transparent 50%);
+  pointer-events: none;
+}
+
+/* Enhanced glow effects */
 .glow-green {
-  box-shadow: 0 0 20px rgba(0, 255, 136, 0.3);
+  box-shadow: 0 0 20px rgba(0, 255, 136, 0.4), 0 0 40px rgba(0, 255, 136, 0.2);
 }
 
 .glow-red {
-  box-shadow: 0 0 20px rgba(255, 68, 102, 0.3);
+  box-shadow: 0 0 20px rgba(255, 68, 102, 0.4), 0 0 40px rgba(255, 68, 102, 0.2);
 }
 
 .glow-yellow {
-  box-shadow: 0 0 20px rgba(255, 170, 0, 0.3);
+  box-shadow: 0 0 20px rgba(255, 170, 0, 0.4), 0 0 40px rgba(255, 170, 0, 0.2);
+}
+
+/* Card hover effects */
+.card-hover {
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.card-hover:hover {
+  transform: translateY(-4px) scale(1.02);
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+}
+
+/* Pulse animation for live indicators */
+@keyframes pulse-glow {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.7;
+    transform: scale(1.1);
+  }
+}
+
+.pulse-glow {
+  animation: pulse-glow 2s ease-in-out infinite;
+}
+
+/* Status indicator animations */
+.status-indicator {
+  position: relative;
+  overflow: hidden;
+}
+
+.status-indicator::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -100%;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.1), transparent);
+  animation: shimmer 2s infinite;
+}
+
+@keyframes shimmer {
+  0% { left: -100%; }
+  100% { left: 100%; }
+}
+
+/* Enhanced button styles */
+.btn-primary {
+  background: linear-gradient(135deg, #00ff88 0%, #00ccff 100%);
+  transition: all 0.3s ease;
+}
+
+.btn-primary:hover {
+  background: linear-gradient(135deg, #00ccff 0%, #00ff88 100%);
+  transform: translateY(-2px);
+  box-shadow: 0 10px 20px rgba(0, 255, 136, 0.3);
 }
