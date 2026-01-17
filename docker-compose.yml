@@ -11,7 +11,7 @@ services:
       - PORT=8080
       - HEARTBEAT_TIMEOUT=30s
       - GITHUB_PAT=${GITHUB_PAT}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - CEREBRAS_API_KEY=${CEREBRAS_API_KEY}
       - OPENCODE_IMAGE=ghcr.io/anomalyco/opencode:latest
       - BACKEND_URL=http://host.docker.internal:8080
     volumes:

@@ -37,7 +37,7 @@ Highline is a lightweight **uptime monitoring** system powered by **AI (OpenCode
 
 - Docker & Docker‑Compose
 - GitHub Personal Access Token (PAT) – used by the auto‑remediation engine.
-- Anthropic API Key – for the OpenCode AI.
+- Cerebras API Key – for the OpenCode AI.
 
 ### Setup
 
@@ -48,7 +48,7 @@ cd repo_highlinebeta
 # Create an .env file with your credentials
 cat <<EOF > .env
 GITHUB_PAT=${{GITHUB_PAT:-your_token_here}}
-ANTHROPIC_API_KEY=${{ANTHROPIC_API_KEY:-your_key_here}}
+CEREBRAS_API_KEY=${{CEREBRAS_API_KEY:-your_key_here}}
 EOF
 
 # Build and run the containers
@@ -139,7 +139,7 @@ curl -X POST http://localhost:8080/heartbeat \
 | `PORT` | `8080` | Backend server port |
 | `HEARTBEAT_TIMEOUT` | `30s` | Time before a service is marked as down |
 | `GITHUB_PAT` | – | GitHub Personal Access Token |
-| `ANTHROPIC_API_KEY` | – | Anthropic API key for OpenCode |
+| `CEREBRAS_API_KEY` | – | Cerebras API key for OpenCode |
 | `OPENCODE_IMAGE` | `ghcr.io/anomalyco/opencode:latest` | Docker image for OpenCode |
 
 ---

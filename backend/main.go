@@ -1,14 +1,38 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/joho/godotenv"
 )
+
+// #region agent log
+func debugLog(location, message, hypothesisId string, data map[string]interface{}) {
+	payload := map[string]interface{}{
+		"sessionId":    "debug-session",
+		"runId":        "initial-debug",
+		"hypothesisId": hypothesisId,
+		"location":     location,
+		"message":      message,
+		"data":         data,
+		"timestamp":    time.Now().UnixMilli(),
+	}
+	body, _ := json.Marshal(payload)
+	resp, err := http.Post("http://host.docker.internal:7242/ingest/818bdc5c-c7d4-4800-bfc7-d2b244b48aae", "application/json", bytes.NewBuffer(body))
+	if err == nil {
+		resp.Body.Close()
+	}
+}
+
+// #endregion
 
 // App holds the application dependencies
 type App struct {
@@ -19,6 +43,25 @@ type App struct {
 }
 
 func main() {
+	// Load .env file from root or current directory
+	if err := godotenv.Load("../.env"); err != nil {
+		if err := godotenv.Load(".env"); err != nil {
+			slog.Info("No .env file found or error loading it, using system environment variables")
+		}
+	}
+
+	// #region agent log
+	cwd, _ := os.Getwd()
+	debugLog("backend/main.go:22", "Main function entry", "H1,H3,H4", map[string]interface{}{
+		"PORT":             os.Getenv("PORT"),
+		"GITHUB_PAT_SET":   os.Getenv("GITHUB_PAT") != "",
+		"CEREBRAS_KEY_SET": os.Getenv("CEREBRAS_API_KEY") != "",
+		"STATIC_DIR":       os.Getenv("STATIC_DIR"),
+		"CWD":              cwd,
+		"ENV_COUNT":        len(os.Environ()),
+	})
+	// #endregion
+
 	// Configure structured JSON logging
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelDebug,
@@ -55,7 +98,7 @@ func main() {
 
 	// Setup routes
 	mux := http.NewServeMux()
-	
+
 	// API endpoints
 	mux.HandleFunc("/api/heartbeat", app.HeartbeatHandler)
 	mux.HandleFunc("/api/services", app.ServicesHandler)
@@ -64,20 +107,20 @@ func main() {
 	mux.HandleFunc("/api/remediations", app.RemediationsHandler)
 	mux.HandleFunc("/api/remediations/", app.RemediationDetailHandler)
 	mux.HandleFunc("/api/remediation/report", app.RemediationReportHandler)
-	
+
 	// Legacy endpoints (for backwards compatibility)
 	mux.HandleFunc("/heartbeat", app.HeartbeatHandler)
 	mux.HandleFunc("/health", app.HealthHandler)
-	
+
 	// WebSocket endpoint
 	mux.Handle("/ws", app.WebSocketHandler())
-	
+
 	// Serve static frontend files
 	staticDir := os.Getenv("STATIC_DIR")
 	if staticDir == "" {
 		staticDir = "./static"
 	}
-	
+
 	// Check if static directory exists
 	if _, err := os.Stat(staticDir); err == nil {
 		slog.Info("Serving static files", "dir", staticDir)
@@ -108,7 +151,11 @@ func main() {
 	// Start server in goroutine
 	go func() {
 		slog.Info("Server starting", "port", port, "heartbeat_timeout", timeout.String())
-		if err := server.ListenAndServe(); err != http.ErrServerClosed {
+		err := server.ListenAndServe()
+		// #region agent log
+		debugLog("backend/main.go:113", "ListenAndServe returned", "H1", map[string]interface{}{"error": err.Error()})
+		// #endregion
+		if err != http.ErrServerClosed {
 			slog.Error("Server error", "error", err)
 			os.Exit(1)
 		}
@@ -145,7 +192,7 @@ func (app *App) runTimeoutChecker(ctx context.Context) {
 		case <-ticker.C:
 			// Check for newly timed out services
 			downServices, updatedServices := app.store.CheckTimeoutsAndUpdateUptime()
-			
+
 			// Handle newly down services
 			for _, service := range downServices {
 				slog.Warn("Service timed out",
@@ -155,7 +202,7 @@ func (app *App) runTimeoutChecker(ctx context.Context) {
 				// Trigger remediation for timed out services
 				go app.TriggerRemediation(service, "Service heartbeat timeout - no response received")
 			}
-			
+
 			// Broadcast all updated services to WebSocket clients
 			for _, service := range updatedServices {
 				app.BroadcastServiceUpdate(service)
@@ -168,14 +215,14 @@ func (app *App) runTimeoutChecker(ctx context.Context) {
 func spaHandler(fs http.Handler, staticDir string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := staticDir + r.URL.Path
-		
+
 		// Check if file exists
 		if _, err := os.Stat(path); os.IsNotExist(err) {
 			// Serve index.html for SPA routing
 			http.ServeFile(w, r, staticDir+"/index.html")
 			return
 		}
-		
+
 		fs.ServeHTTP(w, r)
 	})
 }
@@ -193,9 +240,9 @@ func (app *App) TriggerRemediation(service *Service, errorLog string) {
 		"error", errorLog,
 	)
 
-	app.store.AddRemediationLog(service.Name, 
+	app.store.AddRemediationLog(service.Name,
 		time.Now().Format(time.RFC3339)+" - Remediation triggered: "+errorLog)
-	
+
 	// Broadcast update after adding remediation log
 	if updated, ok := app.store.GetService(service.Name); ok {
 		app.BroadcastServiceUpdate(updated)
@@ -216,7 +263,7 @@ func (app *App) TriggerRemediation(service *Service, errorLog string) {
 		app.store.AddRemediationLog(service.Name,
 			time.Now().Format(time.RFC3339)+" - Remediation completed successfully")
 	}
-	
+
 	// Broadcast final update after remediation completes/fails
 	if updated, ok := app.store.GetService(service.Name); ok {
 		app.BroadcastServiceUpdate(updated)

@@ -22,17 +22,26 @@ type RemediationService struct {
 	store         *RemediationStore
 	githubPAT     string
 	openCodeImage string
-	anthropicKey  string
+	cerebrasKey   string
 	backendURL    string
 }
 
 // NewRemediationService creates a new remediation service
 func NewRemediationService(store *RemediationStore) *RemediationService {
+	// #region agent log
+	debugLog("backend/remediation.go:31", "Attempting Docker client creation", "H2", nil)
+	// #endregion
 	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
+		// #region agent log
+		debugLog("backend/remediation.go:35", "Docker client creation failed", "H2", map[string]interface{}{"error": err.Error()})
+		// #endregion
 		slog.Warn("Failed to create Docker client - remediation disabled", "error", err)
 		return &RemediationService{store: store}
 	}
+	// #region agent log
+	debugLog("backend/remediation.go:40", "Docker client created successfully", "H2", nil)
+	// #endregion
 
 	openCodeImage := os.Getenv("OPENCODE_IMAGE")
 	if openCodeImage == "" {
@@ -49,15 +58,37 @@ func NewRemediationService(store *RemediationStore) *RemediationService {
 		"opencode_image", openCodeImage,
 		"backend_url", backendURL,
 		"github_pat_set", os.Getenv("GITHUB_PAT") != "",
-		"anthropic_key_set", os.Getenv("ANTHROPIC_API_KEY") != "",
+		"cerebras_key_set", os.Getenv("CEREBRAS_API_KEY") != "",
 	)
+
+	githubPat := os.Getenv("GITHUB_PAT")
+	key := os.Getenv("CEREBRAS_API_KEY")
+
+	// #region agent log
+	debugLog("backend/remediation.go:67", "Environment variables check", "H3", map[string]interface{}{
+		"GITHUB_PAT_LEN":   len(githubPat),
+		"CEREBRAS_KEY_LEN": len(key),
+		"GITHUB_PAT_START": func() string {
+			if len(githubPat) > 4 {
+				return githubPat[:4]
+			}
+			return ""
+		}(),
+		"CEREBRAS_KEY_START": func() string {
+			if len(key) > 4 {
+				return key[:4]
+			}
+			return ""
+		}(),
+	})
+	// #endregion
 
 	return &RemediationService{
 		dockerClient:  dockerClient,
 		store:         store,
-		githubPAT:     os.Getenv("GITHUB_PAT"),
+		githubPAT:     githubPat,
 		openCodeImage: openCodeImage,
-		anthropicKey:  os.Getenv("ANTHROPIC_API_KEY"),
+		cerebrasKey:   key,
 		backendURL:    backendURL,
 	}
 }
@@ -69,7 +100,7 @@ func (r *RemediationService) RunOpenCode(repoURL, errorLog, serviceName string) 
 
 	// Create record in store
 	record := r.store.Create(remediationID, serviceName, repoURL, errorLog)
-	
+
 	slog.Info("[REMEDIATION] Starting remediation",
 		"id", remediationID,
 		"service", serviceName,
@@ -87,9 +118,9 @@ func (r *RemediationService) RunOpenCode(repoURL, errorLog, serviceName string) 
 		return fmt.Errorf("GITHUB_PAT environment variable not set")
 	}
 
-	if r.anthropicKey == "" {
-		r.store.Complete(remediationID, false, -1, "ANTHROPIC_API_KEY not set")
-		return fmt.Errorf("ANTHROPIC_API_KEY environment variable not set")
+	if r.cerebrasKey == "" {
+		r.store.Complete(remediationID, false, -1, "CEREBRAS_API_KEY not set")
+		return fmt.Errorf("CEREBRAS_API_KEY environment variable not set")
 	}
 
 	// Create context with timeout
@@ -118,14 +149,14 @@ func (r *RemediationService) RunOpenCode(repoURL, errorLog, serviceName string) 
 
 	// Container configuration
 	containerName := fmt.Sprintf("highline-fix-%s", remediationID)
-	
+
 	r.store.UpdateStatus(remediationID, RemediationRunning, "", containerName)
 
 	containerConfig := &container.Config{
 		Image: r.openCodeImage,
 		Env: []string{
 			"GITHUB_TOKEN=" + r.githubPAT,
-			"ANTHROPIC_API_KEY=" + r.anthropicKey,
+			"CEREBRAS_API_KEY=" + r.cerebrasKey,
 			"GIT_AUTHOR_NAME=Highline AutoFix",
 			"GIT_AUTHOR_EMAIL=autofix@highline.local",
 			"GIT_COMMITTER_NAME=Highline AutoFix",
@@ -158,11 +189,24 @@ func (r *RemediationService) RunOpenCode(repoURL, errorLog, serviceName string) 
 		"container_name", containerName,
 	)
 
+	// #region agent log
+	debugLog("backend/remediation.go:193", "Calling ContainerCreate", "H6,H7", map[string]interface{}{
+		"image":     containerConfig.Image,
+		"env_count": len(containerConfig.Env),
+	})
+	// #endregion
+
 	resp, err := r.dockerClient.ContainerCreate(ctx, containerConfig, hostConfig, nil, nil, containerName)
 	if err != nil {
+		// #region agent log
+		debugLog("backend/remediation.go:202", "ContainerCreate failed", "H6,H7", map[string]interface{}{"error": err.Error()})
+		// #endregion
 		r.store.Complete(remediationID, false, -1, fmt.Sprintf("Failed to create container: %v", err))
 		return fmt.Errorf("failed to create container: %w", err)
 	}
+	// #region agent log
+	debugLog("backend/remediation.go:207", "ContainerCreate successful", "H6,H7", map[string]interface{}{"container_id": resp.ID})
+	// #endregion
 
 	r.store.UpdateStatus(remediationID, RemediationRunning, resp.ID, containerName)
 	record.ContainerID = resp.ID
@@ -267,24 +311,15 @@ func (r *RemediationService) streamContainerLogs(ctx context.Context, containerI
 	defer reader.Close()
 
 	scanner := bufio.NewScanner(reader)
-	lineCount := 0
 	for scanner.Scan() {
 		line := scanner.Text()
 		if len(line) > 8 {
 			cleanLine := line[8:]
 			if strings.TrimSpace(cleanLine) != "" {
-				lineCount++
-				if lineCount <= 5 || lineCount%20 == 0 || 
-				   strings.Contains(strings.ToLower(cleanLine), "error") || 
-				   strings.Contains(strings.ToLower(cleanLine), "success") ||
-				   strings.Contains(strings.ToLower(cleanLine), "commit") ||
-				   strings.Contains(strings.ToLower(cleanLine), "push") {
-					slog.Debug("[REMEDIATION][LOG]",
-						"id", remediationID,
-						"line", lineCount,
-						"content", truncateString(cleanLine, 150),
-					)
-				}
+				slog.Info("[REMEDIATION][LOG]",
+					"id", remediationID,
+					"content", cleanLine,
+				)
 			}
 		}
 	}
@@ -292,28 +327,18 @@ func (r *RemediationService) streamContainerLogs(ctx context.Context, containerI
 
 // buildAgentWrapperScript creates a shell script that runs OpenCode and reports back
 func buildAgentWrapperScript(remediationID, serviceName, repoURL, errorLog, backendURL string) string {
-	// Escape special characters in error log for shell
-	escapedError := strings.ReplaceAll(errorLog, "'", "'\"'\"'")
-	escapedError = strings.ReplaceAll(escapedError, "\n", " ")
-	if len(escapedError) > 500 {
-		escapedError = escapedError[:500]
-	}
-
-	prompt := fmt.Sprintf(`You are an automated bug-fixing agent. Fix the error in service "%s".
-
+	// Simple test prompt - just adds hello world to README
+	prompt := fmt.Sprintf(`
 Repository: %s
 
-Error:
-%s
-
-Steps:
-1. Clone: git clone %s /workspace/repo
+Your task is simple:
+1. Clone the repo: git clone %s /workspace/repo
 2. cd /workspace/repo
-3. Analyze and fix the error
-4. Commit: git commit -am "fix: description"
+3. Add "hello world" to the very end of README.md
+4. Commit: git commit -am "test: added hello world"
 5. Push: git push
 
-GITHUB_TOKEN is set for auth. Keep fix minimal.`, serviceName, repoURL, escapedError, repoURL)
+GITHUB_TOKEN is set for authentication. That's it - just add hello world to the README and push.`, repoURL, repoURL)
 
 	// Shell script that:
 	// 1. Runs OpenCode with the prompt
@@ -386,12 +411,4 @@ echo "=== AGENT COMPLETE ==="
 
 exit $OPENCODE_EXIT
 `, remediationID, serviceName, repoURL, strings.ReplaceAll(prompt, "'", "'\"'\"'"), backendURL, remediationID)
-}
-
-// truncateString truncates a string to maxLen
-func truncateString(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "..."
 }
