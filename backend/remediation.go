@@ -13,6 +13,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/google/uuid"
 )
 
@@ -129,6 +130,7 @@ func (r *RemediationService) RunOpenCode(repoURL, errorLog, serviceName string) 
 		Env: []string{
 			"GITHUB_TOKEN=" + r.githubPAT,
 			"CEREBRAS_API_KEY=" + r.cerebrasKey,
+			"TERM=dumb",
 			"GIT_AUTHOR_NAME=Highline AutoFix",
 			"GIT_AUTHOR_EMAIL=autofix@highline.local",
 			"GIT_COMMITTER_NAME=Highline AutoFix",
@@ -138,9 +140,8 @@ func (r *RemediationService) RunOpenCode(repoURL, errorLog, serviceName string) 
 			"REPO_URL=" + repoURL,
 			"BACKEND_URL=" + r.backendURL,
 		},
-		Cmd: []string{
-			"/bin/sh", "-c", wrapperScript,
-		},
+		Entrypoint: []string{"/bin/sh", "-c"},
+		Cmd:        []string{wrapperScript},
 		WorkingDir: "/workspace",
 		Tty:        false,
 	}
@@ -256,30 +257,40 @@ func (r *RemediationService) cleanupContainer(ctx context.Context, containerID, 
 	}
 }
 
-// streamContainerLogs streams container logs
+// streamContainerLogs streams container logs properly handling the Docker multiplexed stream
 func (r *RemediationService) streamContainerLogs(ctx context.Context, containerID, remediationID string) {
 	reader, err := r.dockerClient.ContainerLogs(ctx, containerID, container.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Follow:     true,
-		Timestamps: true,
+		Timestamps: false,
 	})
 	if err != nil {
 		return
 	}
 	defer reader.Close()
 
-	scanner := bufio.NewScanner(reader)
+	// Use a pipe to convert the multiplexed stream into a readable format
+	stdoutReader, stdoutWriter := io.Pipe()
+
+	go func() {
+		// StdCopy handles the 8-byte Docker headers correctly
+		// It will split the multiplexed stream from reader into stdoutWriter and stderrWriter (we use same for both)
+		_, err := stdcopy.StdCopy(stdoutWriter, stdoutWriter, reader)
+		if err != nil {
+			slog.Error("[REMEDIATION][LOG_ERROR]", "id", remediationID, "error", err)
+		}
+		stdoutWriter.Close()
+	}()
+
+	scanner := bufio.NewScanner(stdoutReader)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if len(line) > 8 {
-			cleanLine := line[8:]
-			if strings.TrimSpace(cleanLine) != "" {
-				slog.Info("[REMEDIATION][LOG]",
-					"id", remediationID,
-					"content", cleanLine,
-				)
-			}
+		if strings.TrimSpace(line) != "" {
+			slog.Info("[REMEDIATION][LOG]",
+				"id", remediationID,
+				"content", line,
+			)
 		}
 	}
 }
@@ -304,7 +315,7 @@ GITHUB_TOKEN is set for authentication. That's it - just add hello world to the 
 	// 2. Captures the result
 	// 3. Sends a report back to the backend
 	return fmt.Sprintf(`#!/bin/sh
-set -e
+set -x
 
 echo "=== HIGHLINE AGENT STARTED ==="
 echo "Remediation ID: %s"
@@ -312,11 +323,23 @@ echo "Service: %s"
 echo "Repository: %s"
 echo ""
 
-# Configure OpenCode
-mkdir -p ~/.config/opencode
-cat <<EOF > ~/.config/opencode/opencode.json
+echo "=== DEBUG INFO ==="
+echo "HOME=$HOME"
+echo "USER=$(whoami)"
+echo "CEREBRAS_API_KEY set: $([ -n "$CEREBRAS_API_KEY" ] && echo 'YES' || echo 'NO')"
+echo "CEREBRAS_API_KEY length: ${#CEREBRAS_API_KEY}"
+echo "GITHUB_TOKEN set: $([ -n "$GITHUB_TOKEN" ] && echo 'YES' || echo 'NO')"
+echo ""
+
+# Configure OpenCode for Cerebras
+echo "=== CONFIGURING OPENCODE ==="
+mkdir -p $HOME/.config/opencode
+echo "Config dir: $HOME/.config/opencode"
+
+	# Write config with actual API key directly
+	cat > $HOME/.config/opencode/opencode.json << 'CONFIGEOF'
 {
-  "\$schema": "https://opencode.ai/config.json",
+  "$schema": "https://opencode.ai/config.json",
   "model": "cerebras/llama-3.3-70b",
   "provider": {
     "cerebras": {
@@ -331,7 +354,15 @@ cat <<EOF > ~/.config/opencode/opencode.json
     }
   }
 }
-EOF
+CONFIGEOF
+
+echo ""
+echo "=== OPENCODE CONFIG FILE ==="
+ls -la $HOME/.config/opencode/
+echo ""
+echo "Contents of opencode.json:"
+cat $HOME/.config/opencode/opencode.json
+echo ""
 
 # Create workspace
 mkdir -p /workspace
@@ -339,8 +370,13 @@ cd /workspace
 
 # Run OpenCode
 echo "=== RUNNING OPENCODE ==="
-OPENCODE_OUTPUT=$(opencode --print --dangerously-skip-permissions '%s' 2>&1) || OPENCODE_EXIT=$?
+ls -R /workspace
+# Removed --dangerously-skip-permissions as it is not supported in 'run'
+opencode run '%s' 2>&1 || OPENCODE_EXIT=$?
 OPENCODE_EXIT=${OPENCODE_EXIT:-0}
+
+echo "=== WORKSPACE AFTER OPENCODE ==="
+ls -R /workspace
 
 echo ""
 echo "=== OPENCODE FINISHED (exit: $OPENCODE_EXIT) ==="
@@ -374,9 +410,9 @@ echo ""
 echo "=== SENDING REPORT TO BACKEND ==="
 
 # Send report back to backend
-curl -X POST "%s/api/remediation/report" \
-    -H "Content-Type: application/json" \
-    -d '{
+echo "Reporting to: %s/api/remediation/report"
+# Using wget instead of curl as curl is missing in the opencode image
+wget -qO- --post-data='{
         "remediation_id": "%s",
         "success": '$SUCCESS',
         "summary": "'"$SUMMARY"'",
@@ -384,11 +420,11 @@ curl -X POST "%s/api/remediation/report" \
         "pushed": '$PUSHED',
         "files_changed": ["'"$FILES_CHANGED"'"],
         "logs": "OpenCode exit code: '"$OPENCODE_EXIT"'"
-    }' 2>/dev/null || echo "Failed to send report"
+    }' --header='Content-Type: application/json' "%s/api/remediation/report" || echo "Failed to send report (exit: $?)"
 
 echo ""
 echo "=== AGENT COMPLETE ==="
 
 exit $OPENCODE_EXIT
-`, remediationID, serviceName, repoURL, strings.ReplaceAll(prompt, "'", "'\"'\"'"), backendURL, remediationID)
+`, remediationID, serviceName, repoURL, strings.ReplaceAll(prompt, "'", "'\"'\"'"), backendURL, remediationID, backendURL)
 }
