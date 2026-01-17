@@ -297,28 +297,19 @@ func (r *RemediationService) streamContainerLogs(ctx context.Context, containerI
 
 // buildAgentWrapperScript creates a shell script that runs OpenCode and reports back
 func buildAgentWrapperScript(remediationID, serviceName, repoURL, errorLog, backendURL string) string {
-	// Simple test prompt - just adds hello world to README
+	// Simple test prompt - focus only on code changes
 	prompt := fmt.Sprintf(`
-Repository: %s
+You are in a git repository. Your ONLY task is to go into the README and add a "hello world" at the very end. Thats it.
 
-Your task is simple:
-1. Clone the repo: git clone %s /workspace/repo
-2. cd /workspace/repo
-3. create a new branch with an appropriate name (such as adding-hello-world)
-4. Add "hello world" to the very end of README.md
-5. Commit: git commit -am "test: added hello world"
-6. Push: git push
+Error: %s
 
-If you encounter an issue with any step here, work around it. If a directory already exists, ok fine, make another one. 
-It doesn't have to be that specific or precise. Just roughly, clone the repo, add a hello world in the end, and push it in a new branch. 
-All you gotta do. The above steps are purely for guidance. 
+Guidelines:
+1. DO NOT commit your changes.
+2. DO NOT push your changes.
+3. DO NOT create new branches.
+Just add the hello world at the end`, strings.ReplaceAll(errorLog, "'", "'\"'\"'"))
 
-GITHUB_TOKEN is set for authentication. That's it - just add hello world to the README and push.`, repoURL, repoURL)
-
-	// Shell script that:
-	// 1. Runs OpenCode with the prompt
-	// 2. Captures the result
-	// 3. Sends a report back to the backend
+	// Shell script that handles git mechanistically
 	return fmt.Sprintf(`#!/bin/sh
 set -x
 
@@ -326,14 +317,6 @@ echo "=== HIGHLINE AGENT STARTED ==="
 echo "Remediation ID: %s"
 echo "Service: %s"
 echo "Repository: %s"
-echo ""
-
-echo "=== DEBUG INFO ==="
-echo "HOME=$HOME"
-echo "USER=$(whoami)"
-echo "CEREBRAS_API_KEY set: $([ -n "$CEREBRAS_API_KEY" ] && echo 'YES' || echo 'NO')"
-echo "CEREBRAS_API_KEY length: ${#CEREBRAS_API_KEY}"
-echo "GITHUB_TOKEN set: $([ -n "$GITHUB_TOKEN" ] && echo 'YES' || echo 'NO')"
 echo ""
 
 # Pre-install essential dev tools
@@ -347,21 +330,23 @@ fi
 # Configure OpenCode for Cerebras
 echo "=== CONFIGURING OPENCODE ==="
 mkdir -p $HOME/.config/opencode
-echo "Config dir: $HOME/.config/opencode"
-
-	# Write config with actual API key directly
-	cat > $HOME/.config/opencode/opencode.json << 'CONFIGEOF'
+cat > $HOME/.config/opencode/opencode.json << 'CONFIGEOF'
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "gpt-oss-120b",
+  "model": "cerebras/gpt-oss-120b",
   "provider": {
     "cerebras": {
+      "api": "openai",
+      "name": "Cerebras",
       "models": {
         "gpt-oss-120b": {
-          "id": "gpt-oss-120b"
+          "id": "gpt-oss-120b",
+          "name": "OpenAI GPT-OSS 120B",
+          "context_length": 131072
         }
       },
       "options": {
+        "baseURL": "https://api.cerebras.ai/v1",
         "apiKey": "{env:CEREBRAS_API_KEY}"
       }
     }
@@ -369,75 +354,74 @@ echo "Config dir: $HOME/.config/opencode"
 }
 CONFIGEOF
 
-echo ""
-echo "=== OPENCODE CONFIG FILE ==="
-ls -la $HOME/.config/opencode/
-echo ""
-echo "Contents of opencode.json:"
-cat $HOME/.config/opencode/opencode.json
-echo ""
-
-# Create workspace
+# Setup workspace
 mkdir -p /workspace
 cd /workspace
 
-# Run OpenCode
-echo "=== RUNNING OPENCODE ==="
-ls -R /workspace
-# Removed --dangerously-skip-permissions as it is not supported in 'run'
+# Mechanistically clone and setup
+echo "=== MECHANISTIC SETUP ==="
+# Strip https:// from repoURL for token auth
+REPO_PATH=$(echo "%s" | sed 's|https://||')
+git clone "https://x-access-token:$GITHUB_TOKEN@$REPO_PATH" repo
+cd /workspace/repo
+
+# Create a unique branch for this fix
+BRANCH_NAME="highline-fix-%s"
+git checkout -b "$BRANCH_NAME"
+
+# Configure git identity
+git config user.name "Highline AutoFix"
+git config user.email "autofix@highline.local"
+
+# Run OpenCode ONLY to fix the code
+echo "=== RUNNING OPENCODE (EDIT MODE) ==="
 opencode run '%s' 2>&1 || OPENCODE_EXIT=$?
 OPENCODE_EXIT=${OPENCODE_EXIT:-0}
 
-echo "=== WORKSPACE AFTER OPENCODE ==="
-ls -R /workspace
+echo "=== CHECKING FOR CHANGES ==="
+git status
+CHANGES=$(git status --porcelain)
 
-echo ""
-echo "=== OPENCODE FINISHED (exit: $OPENCODE_EXIT) ==="
-
-# Check if repo was cloned and has commits
 COMMIT_HASH=""
-FILES_CHANGED=""
 PUSHED="false"
 
-if [ -d "/workspace/repo/.git" ]; then
-    cd /workspace/repo
-    COMMIT_HASH=$(git rev-parse HEAD 2>/dev/null || echo "")
-    FILES_CHANGED=$(git diff --name-only HEAD~1 2>/dev/null | tr '\n' ',' || echo "")
+if [ -n "$CHANGES" ]; then
+    echo "Changes detected! Mechanistically committing and pushing..."
+    git add .
+    git commit -m "fix: automatically applied remediation for %s"
+    COMMIT_HASH=$(git rev-parse HEAD)
     
-    # Check if we pushed
-    if git log --oneline -1 2>/dev/null | grep -q "fix:"; then
-        PUSHED="true"
-    fi
+    echo "Pushing to origin..."
+    git push origin "$BRANCH_NAME" && PUSHED="true"
+else
+    echo "No changes were made by the agent."
 fi
 
 # Determine success
-if [ "$OPENCODE_EXIT" -eq 0 ] && [ -n "$COMMIT_HASH" ]; then
+if [ -n "$COMMIT_HASH" ] && [ "$PUSHED" = "true" ]; then
     SUCCESS="true"
-    SUMMARY="Successfully analyzed and attempted fix"
+    SUMMARY="Successfully applied and pushed fix to branch $BRANCH_NAME"
 else
     SUCCESS="false"
-    SUMMARY="Failed to complete fix"
+    SUMMARY="Failed to apply or push fix (exit: $OPENCODE_EXIT)"
 fi
 
 echo ""
 echo "=== SENDING REPORT TO BACKEND ==="
-
-# Send report back to backend
 echo "Reporting to: %s/api/remediation/report"
-# Using wget instead of curl as curl is missing in the opencode image
 wget -qO- --post-data='{
         "remediation_id": "%s",
         "success": '$SUCCESS',
         "summary": "'"$SUMMARY"'",
         "commit_hash": "'"$COMMIT_HASH"'",
         "pushed": '$PUSHED',
-        "files_changed": ["'"$FILES_CHANGED"'"],
-        "logs": "OpenCode exit code: '"$OPENCODE_EXIT"'"
+        "files_changed": ["'$(echo "$CHANGES" | tr '\n' ',' | sed 's/,$//')'"],
+        "logs": "OpenCode exit: '"$OPENCODE_EXIT"'"
     }' --header='Content-Type: application/json' "%s/api/remediation/report" || echo "Failed to send report (exit: $?)"
 
 echo ""
 echo "=== AGENT COMPLETE ==="
 
 exit $OPENCODE_EXIT
-`, remediationID, serviceName, repoURL, strings.ReplaceAll(prompt, "'", "'\"'\"'"), backendURL, remediationID, backendURL)
+`, remediationID, serviceName, repoURL, repoURL, remediationID, strings.ReplaceAll(prompt, "'", "'\"'\"'"), serviceName, backendURL, remediationID, backendURL)
 }
