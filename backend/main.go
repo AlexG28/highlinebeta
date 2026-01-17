@@ -1,0 +1,212 @@
+package main
+
+import (
+	"context"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+)
+
+// App holds the application dependencies
+type App struct {
+	store       *ServiceStore
+	remediation *RemediationService
+	wsHub       *WSHub
+}
+
+func main() {
+	// Configure structured JSON logging
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	}))
+	slog.SetDefault(logger)
+
+	slog.Info("Starting Highline Monitoring Service")
+
+	// Get configuration from environment
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	timeout := 30 * time.Second
+	if t := os.Getenv("HEARTBEAT_TIMEOUT"); t != "" {
+		if parsed, err := time.ParseDuration(t); err == nil {
+			timeout = parsed
+		}
+	}
+
+	// Initialize services
+	store := NewServiceStore(timeout)
+	remediation := NewRemediationService()
+	wsHub := NewWSHub()
+
+	app := &App{
+		store:       store,
+		remediation: remediation,
+		wsHub:       wsHub,
+	}
+
+	// Setup routes
+	mux := http.NewServeMux()
+	
+	// API endpoints
+	mux.HandleFunc("/api/heartbeat", app.HeartbeatHandler)
+	mux.HandleFunc("/api/services", app.ServicesHandler)
+	mux.HandleFunc("/api/services/", app.ServiceHandler)
+	mux.HandleFunc("/api/health", app.HealthHandler)
+	
+	// Legacy endpoints (for backwards compatibility)
+	mux.HandleFunc("/heartbeat", app.HeartbeatHandler)
+	mux.HandleFunc("/health", app.HealthHandler)
+	
+	// WebSocket endpoint
+	mux.Handle("/ws", app.WebSocketHandler())
+	
+	// Serve static frontend files
+	staticDir := os.Getenv("STATIC_DIR")
+	if staticDir == "" {
+		staticDir = "./static"
+	}
+	
+	// Check if static directory exists
+	if _, err := os.Stat(staticDir); err == nil {
+		slog.Info("Serving static files", "dir", staticDir)
+		fileServer := http.FileServer(http.Dir(staticDir))
+		mux.Handle("/", spaHandler(fileServer, staticDir))
+	} else {
+		slog.Warn("Static directory not found, frontend will not be served", "dir", staticDir)
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"status":"ok","message":"Highline API - frontend not available"}`))
+		})
+	}
+
+	// Apply middleware
+	handler := corsMiddleware(loggingMiddleware(mux))
+
+	server := &http.Server{
+		Addr:         ":" + port,
+		Handler:      handler,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+	}
+
+	// Start timeout checker in background
+	ctx, cancel := context.WithCancel(context.Background())
+	go app.runTimeoutChecker(ctx)
+
+	// Start server in goroutine
+	go func() {
+		slog.Info("Server starting", "port", port, "heartbeat_timeout", timeout.String())
+		if err := server.ListenAndServe(); err != http.ErrServerClosed {
+			slog.Error("Server error", "error", err)
+			os.Exit(1)
+		}
+	}()
+
+	// Wait for interrupt signal
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	slog.Info("Shutting down server...")
+	cancel()
+
+	// Graceful shutdown
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		slog.Error("Server shutdown error", "error", err)
+	}
+
+	slog.Info("Server stopped")
+}
+
+// runTimeoutChecker periodically checks for timed out services
+func (app *App) runTimeoutChecker(ctx context.Context) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			downServices := app.store.CheckTimeouts()
+			for _, service := range downServices {
+				slog.Warn("Service timed out",
+					"service", service.Name,
+					"last_heartbeat", service.LastHeartbeat,
+				)
+				// Broadcast the update to all WebSocket clients
+				app.BroadcastServiceUpdate(service)
+				// Trigger remediation for timed out services
+				go app.TriggerRemediation(service, "Service heartbeat timeout - no response received")
+			}
+		}
+	}
+}
+
+// spaHandler wraps a file server to handle SPA routing
+func spaHandler(fs http.Handler, staticDir string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := staticDir + r.URL.Path
+		
+		// Check if file exists
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			// Serve index.html for SPA routing
+			http.ServeFile(w, r, staticDir+"/index.html")
+			return
+		}
+		
+		fs.ServeHTTP(w, r)
+	})
+}
+
+// TriggerRemediation triggers the OpenCode remediation for a failed service
+func (app *App) TriggerRemediation(service *Service, errorLog string) {
+	if service.GitHubRepo == "" {
+		slog.Warn("Cannot remediate service without GitHub repo", "service", service.Name)
+		return
+	}
+
+	slog.Info("Triggering remediation",
+		"service", service.Name,
+		"github_repo", service.GitHubRepo,
+		"error", errorLog,
+	)
+
+	app.store.AddRemediationLog(service.Name, 
+		time.Now().Format(time.RFC3339)+" - Remediation triggered: "+errorLog)
+	
+	// Broadcast update after adding remediation log
+	if updated, ok := app.store.GetService(service.Name); ok {
+		app.BroadcastServiceUpdate(updated)
+	}
+
+	err := app.remediation.RunOpenCode(service.GitHubRepo, errorLog, service.Name)
+	if err != nil {
+		slog.Error("Remediation failed",
+			"service", service.Name,
+			"error", err,
+		)
+		app.store.AddRemediationLog(service.Name,
+			time.Now().Format(time.RFC3339)+" - Remediation failed: "+err.Error())
+	} else {
+		slog.Info("Remediation completed",
+			"service", service.Name,
+		)
+		app.store.AddRemediationLog(service.Name,
+			time.Now().Format(time.RFC3339)+" - Remediation completed successfully")
+	}
+	
+	// Broadcast final update after remediation completes/fails
+	if updated, ok := app.store.GetService(service.Name); ok {
+		app.BroadcastServiceUpdate(updated)
+	}
+}
